@@ -36,7 +36,15 @@ prevents a new test from getting its own database.
 
 ## Creating a test database
 
-Create a database from scratch and run setup statements with `WithStatements`:
+The usual setup is a pre-created template database, either empty or containing seed data, that PostgreSQL clones for each test:
+
+```go
+tdb := pgtestdb.New(t, pgtestdb.WithTemplate("myapp_template"))
+```
+
+The template must already exist and must be a trusted PostgreSQL database identifier. PostgreSQL must be able to create the new database from that template. `WithStatements` can also be supplied with `WithTemplate` to apply additional setup after the clone.
+
+If you do not have a template, you can create a schema on the fly with `WithStatements`:
 
 ```go
 package users_test
@@ -59,14 +67,6 @@ func TestUsers(t *testing.T) {
 ```
 
 `WithStatements` options run in the order supplied. Multiple `WithStatements` options append to the same ordered list.
-
-To clone an existing database, use `WithTemplate`:
-
-```go
-tdb := pgtestdb.New(t, pgtestdb.WithTemplate("identity_platform_test"))
-```
-
-The template must already exist and must be a trusted PostgreSQL database identifier. PostgreSQL must be able to create the new database from that template. `WithStatements` can also be supplied with `WithTemplate` to apply additional setup after the clone.
 
 ## `TestDB` API
 
@@ -121,7 +121,7 @@ if !ok {
 2. Drop the generated database.
 3. Close the admin connection.
 
-Close any additional connections opened by the test before cleanup runs. If dropping a database fails, usually because a connection is still open, `pgtestdb` creates a `<database>_requires_cleanup` marker database. A later `New` removes leftover marker databases before creating its own database.
+Close any additional connections opened by the test before cleanup runs. If dropping a database fails, usually because a connection is still open, the `<name>_requires_cleanup` marker and retry behavior described in [Leftover databases](#leftover-databases) apply.
 
 ## Development
 
