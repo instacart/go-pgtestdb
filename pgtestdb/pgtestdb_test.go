@@ -65,8 +65,8 @@ func TestPgtestdb(t *testing.T) {
 		dbName := dbNamePrefix + fmt.Sprintf("%x", rand.Uint64())
 		ExecOrFail(t, conn, createDatabaseSQL(dbName+cleanupSuffix, ""))
 
-		// decoy matches the pattern with unescaped underscores (LIKE treats _
-		// as any single character) but is not a cleanup marker.
+		// The LIKE pattern intentionally leaves underscores unescaped, so the
+		// decoy matches the query but not cleanupMarkerName's literal checks.
 		decoy := dbNamePrefix + "prod_requiresXcleanup"
 		ExecOrFail(t, conn, createDatabaseSQL(decoy, ""))
 		defer func() { _, _ = conn.Exec(ctx, dropDatabaseSQL(decoy)) }()
@@ -81,13 +81,6 @@ func TestPgtestdb(t *testing.T) {
 		assert.NotContains(t, getDBNamesToCleanup(ctx, t, conn), dbName)
 		assert.False(t, dbExists(ctx, t, conn, dbName))
 		assert.True(t, dbExists(ctx, t, conn, decoy), "cleanup must not drop a database that only resembles a marker")
-	})
-
-	t.Run("escapeLike", func(t *testing.T) {
-		assert.Equal(t, `pgtestdb\_`, escapeLike(dbNamePrefix))
-		assert.Equal(t, `\_requires\_cleanup`, escapeLike(cleanupSuffix))
-		assert.Equal(t, `100\%\_a\\b`, escapeLike(`100%_a\b`))
-		assert.Equal(t, "plain", escapeLike("plain"))
 	})
 
 	t.Run("cleanupMarkerName", func(t *testing.T) {

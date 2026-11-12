@@ -214,15 +214,6 @@ func fatalOnError(t TB, err error, msg string) {
 	}
 }
 
-// likeEscaper escapes the LIKE pattern metacharacters %, _ and \ so that text
-// containing them matches literally under ESCAPE '\'.
-var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-
-// escapeLike escapes s so it matches literally inside a LIKE pattern.
-func escapeLike(s string) string {
-	return likeEscaper.Replace(s)
-}
-
 // cleanupMarkerName returns the database name that the marker datname points
 // at. It reports false unless datname has the literal pgtestdb_ prefix and
 // _requires_cleanup suffix, so a LIKE pattern that over-matches can never cause
@@ -236,8 +227,12 @@ func cleanupMarkerName(datname string) (string, bool) {
 
 func getDBNamesToCleanup(ctx context.Context, t TB, conn *pgx.Conn) []string {
 	t.Helper()
-	pattern := escapeLike(dbNamePrefix) + "%" + escapeLike(cleanupSuffix)
-	rows, err := conn.Query(ctx, `SELECT datname FROM pg_database WHERE datname LIKE $1 ESCAPE '\'`, pattern)
+	// The underscores are intentionally unescaped: LIKE treats them as
+	// single-character wildcards, so this may match a superset of the marker
+	// names. cleanupMarkerName checks the literal prefix and suffix before
+	// anything is dropped, which keeps the pattern simple and safe.
+	pattern := dbNamePrefix + "%" + cleanupSuffix
+	rows, err := conn.Query(ctx, `SELECT datname FROM pg_database WHERE datname LIKE $1`, pattern)
 	fatalOnError(t, err, "pgtestdb: query for DBs to clean up")
 	defer rows.Close()
 
