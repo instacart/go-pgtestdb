@@ -138,7 +138,7 @@ func New(t TB, opts ...Option) *TestDB {
 
 	ExecOrFail(t, adminConn, createDatabaseSQL(dbName, cfg.template))
 
-	testURL := buildURL(t, baseURL, dbName)
+	testURL := buildURL(t, baseURL, dbName, true)
 	pool, err := pgxpool.New(ctx, testURL)
 	fatalOnError(t, err, "pgtestdb: create pool for test db")
 	// registered 3rd: runs first (LIFO), before tryDropDB. The close is
@@ -198,7 +198,7 @@ func adminConnect(ctx context.Context, t TB, baseURL string) *pgx.Conn {
 	t.Helper()
 	// Reuse buildURL so the admin connection gets the same sslmode default as
 	// the generated test database while retaining the base URL's database.
-	return connect(ctx, t, buildURL(t, baseURL, ""))
+	return connect(ctx, t, buildURL(t, baseURL, "", false))
 }
 
 // connect opens a single connection from a URL. It parses with pgxpool so
@@ -233,7 +233,7 @@ func resolveDBURL(optionURL string) string {
 // The authority is therefore copied verbatim and query parameters are kept raw,
 // which also preserves pgx-specific syntax ("+" is a literal plus sign, not a
 // space) that net/url would rewrite.
-func buildURL(t TB, baseURL, dbName string) string {
+func buildURL(t TB, baseURL, dbName string, stripDBAliases bool) string {
 	t.Helper()
 	scheme, rest, ok := strings.Cut(baseURL, "://")
 	if !ok {
@@ -260,13 +260,16 @@ func buildURL(t TB, baseURL, dbName string) string {
 	authority, rest := rest[:end], rest[end:]
 
 	// Preserve the base path for the admin connection (empty dbName); a
-	// generated database name replaces it for the test connection.
+	// generated database name replaces it for the test connection. Only the
+	// path portion is searched: a slash in a pathless URL's query string is not
+	// a database path.
 	basePath := "/"
-	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
-		basePath = rest[slash:]
-		if query := strings.IndexByte(basePath, '?'); query >= 0 {
-			basePath = basePath[:query]
-		}
+	pathEnd := strings.IndexByte(rest, '?')
+	if pathEnd < 0 {
+		pathEnd = len(rest)
+	}
+	if slash := strings.IndexByte(rest[:pathEnd], '/'); slash >= 0 {
+		basePath = rest[slash:pathEnd]
 	}
 
 	// The generated database name replaces the base path; only the query is
@@ -275,7 +278,7 @@ func buildURL(t TB, baseURL, dbName string) string {
 	if i := strings.IndexByte(rest, '?'); i >= 0 {
 		rawQuery = rest[i+1:]
 	}
-	rawQuery, sawSSL := rewriteQuery(rawQuery)
+	rawQuery, sawSSL := rewriteQuery(rawQuery, stripDBAliases)
 	if !sawSSL {
 		// pgx maps the ssl=true alias to sslmode=require, and an explicit
 		// sslmode wins over the alias, so adding sslmode=disable when neither
@@ -308,7 +311,7 @@ func buildURL(t TB, baseURL, dbName string) string {
 //
 // sawSSL reports whether an ssl or sslmode key was present, so the caller can
 // avoid adding a default that would override the requested TLS mode.
-func rewriteQuery(rawQuery string) (rewritten string, sawSSL bool) {
+func rewriteQuery(rawQuery string, stripDBAliases bool) (rewritten string, sawSSL bool) {
 	kept := make([]string, 0, strings.Count(rawQuery, "&")+1)
 	for _, param := range strings.Split(rawQuery, "&") {
 		if param == "" {
@@ -323,7 +326,7 @@ func rewriteQuery(rawQuery string) (rewritten string, sawSSL bool) {
 			// pgx rejects the same malformed escape when it parses the URL.
 			key = rawKey
 		}
-		if strings.EqualFold(key, "dbname") || strings.EqualFold(key, "database") {
+		if stripDBAliases && (strings.EqualFold(key, "dbname") || strings.EqualFold(key, "database")) {
 			continue
 		}
 		if strings.EqualFold(key, "ssl") || strings.EqualFold(key, "sslmode") {
