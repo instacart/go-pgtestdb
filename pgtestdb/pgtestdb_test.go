@@ -63,6 +63,10 @@ func TestPgtestdb(t *testing.T) {
 		start := time.Now()
 		fakeT.cleanups[len(fakeT.cleanups)-1]()
 		closeElapsed := time.Since(start)
+		// Capture the message now: the remaining cleanups run against the busy
+		// database and legitimately report their own errors, which overwrite
+		// fakeT.errMsg.
+		closeErrMsg := fakeT.errMsg
 		for i := len(fakeT.cleanups) - 2; i >= 0; i-- {
 			fakeT.cleanups[i]()
 		}
@@ -70,6 +74,8 @@ func TestPgtestdb(t *testing.T) {
 		assert.False(t, fakeT.fatal, "cleanup must not abort: %s", fakeT.errMsg)
 		assert.Less(t, closeElapsed, time.Second,
 			"pool close must not wait indefinitely for an abandoned transaction")
+		assert.Contains(t, closeErrMsg, poolCloseErrorMessage,
+			"a pool close timeout must be reported as a test error")
 
 		admin := adminConnect(ctx, t, resolveDBURL(""))
 		defer func() { _ = admin.Close(ctx) }()

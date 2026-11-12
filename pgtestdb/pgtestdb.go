@@ -98,6 +98,10 @@ var dropDBResultHook = func(actual bool) bool { return actual }
 // run and the suite would hang until its global timeout.
 var poolCloseTimeout = 5 * time.Second
 
+// poolCloseErrorMessage explains a closePool timeout: the pool is still holding
+// an acquired connection, which almost always means a test leaked one.
+const poolCloseErrorMessage = "Failed to close pgtestdb pool, this usually means a test kept an open connection/transaction even after it finished which blocked closing of the pool."
+
 // New creates a temporary Postgres database for the duration of t.
 //
 // The database is automatically dropped at t.Cleanup. The connection URL comes
@@ -174,7 +178,8 @@ func ExecOrError(t TB, exec execer, stmt string, args ...any) bool {
 // returned; a test that exited through Fatal while holding an uncommitted
 // transaction never returns them. Cleanup therefore waits at most
 // poolCloseTimeout and then continues, leaving the abandoned connections to be
-// torn down when the process exits.
+// torn down when the process exits. Hitting the timeout is reported as a test
+// error, since an open connection/transaction survived its test.
 func closePool(t TB, pool *pgxpool.Pool) {
 	t.Helper()
 	closed := make(chan struct{})
@@ -185,6 +190,7 @@ func closePool(t TB, pool *pgxpool.Pool) {
 	select {
 	case <-closed:
 	case <-time.After(poolCloseTimeout):
+		t.Errorf("%s", poolCloseErrorMessage)
 	}
 }
 
