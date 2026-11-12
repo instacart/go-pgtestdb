@@ -196,11 +196,12 @@ func closePool(t TB, pool *pgxpool.Pool) {
 
 func adminConnect(ctx context.Context, t TB, baseURL string) *pgx.Conn {
 	t.Helper()
-	// The admin connection shares the base URL with the test pool, so it can
-	// carry pool_* options (pool_max_conns, ...). Parse with pgxpool, which
-	// consumes those as pool settings; pgx.Connect would instead forward them
-	// as startup parameters, which PostgreSQL rejects.
-	cfg, err := pgxpool.ParseConfig(buildURL(t, baseURL, ""))
+	// The base URL can carry pool_* options (pool_max_conns, ...). Parse with
+	// pgxpool, which consumes those as pool settings; pgx.Connect would instead
+	// forward them as startup parameters, which PostgreSQL rejects. pgxpool is
+	// also the source of truth for how the URL is interpreted, so the admin
+	// connection uses it directly rather than a rebuilt URL.
+	cfg, err := pgxpool.ParseConfig(baseURL)
 	fatalOnError(t, err, "pgtestdb: parse database URL")
 	conn, err := pgx.ConnectConfig(ctx, cfg.ConnConfig)
 	fatalOnError(t, err, "pgtestdb: admin connect")
@@ -219,45 +220,87 @@ func resolveDBURL(optionURL string) string {
 	return defaultDBURL
 }
 
-// buildURL returns the connection URL for the given database name.
-// If dbName is empty, the path from baseURL is kept (suitable for admin connections).
+// buildURL returns the connection URL for the generated database dbName.
+//
+// It rewrites baseURL textually instead of parsing and re-encoding it with
+// net/url. url.Parse rejects percent-encoded hosts such as the escaped Unix
+// socket directory %2Fvar%2Frun%2Fpostgresql, even though pgx accepts them.
+// The authority is therefore copied verbatim and query parameters are kept raw,
+// which also preserves pgx-specific syntax ("+" is a literal plus sign, not a
+// space) that net/url would rewrite.
 func buildURL(t TB, baseURL, dbName string) string {
 	t.Helper()
-	u, err := url.Parse(baseURL)
-	fatalOnError(t, err, "pgtestdb: parse database URL")
-	q, err := parseQuery(u.RawQuery)
-	fatalOnError(t, err, "pgtestdb: parse database URL query")
-	if dbName != "" {
-		u.Path = "/" + dbName
-		// pgx lets the dbname/database query aliases override the path, so
-		// drop them; otherwise the pool would connect to the base database
-		// while only the unused generated database is dropped.
-		q.Del("dbname")
-		q.Del("database")
+	scheme, rest, ok := strings.Cut(baseURL, "://")
+	if !ok {
+		t.Fatalf("pgtestdb: database URL must start with scheme://")
 	}
-	// pgx maps the ssl=true alias to sslmode=require. Adding sslmode=disable
-	// would win over the alias and silently drop requested TLS.
-	if !q.Has("sslmode") && !q.Has("ssl") {
-		q.Set("sslmode", "disable")
+
+	// The authority runs to the first path separator or query delimiter:
+	// userinfo, IPv6 literals, comma-separated hosts, and percent-encoded Unix
+	// socket paths are all kept exactly as given.
+	end := strings.IndexAny(rest, "/?")
+	if end < 0 {
+		end = len(rest)
 	}
-	u.RawQuery = encodeQuery(q)
-	return u.String()
+	authority, rest := rest[:end], rest[end:]
+
+	// The generated database name replaces the base path; only the query is
+	// carried over.
+	var rawQuery string
+	if i := strings.IndexByte(rest, '?'); i >= 0 {
+		rawQuery = rest[i+1:]
+	}
+	rawQuery, sawSSL := rewriteQuery(rawQuery)
+	if !sawSSL {
+		// pgx maps the ssl=true alias to sslmode=require, and an explicit
+		// sslmode wins over the alias, so adding sslmode=disable when neither
+		// was given must not override a requested TLS mode.
+		if rawQuery != "" {
+			rawQuery += "&"
+		}
+		rawQuery += "sslmode=disable"
+	}
+
+	// dbName is generated from a fixed prefix and hex digits, so it needs no
+	// path escaping.
+	u := scheme + "://" + authority + "/" + dbName
+	if rawQuery != "" {
+		u += "?" + rawQuery
+	}
+	return u
 }
 
-// parseQuery decodes rawQuery using PostgreSQL URI semantics. Unlike
-// url.ParseQuery, pgx treats "+" as a literal plus sign rather than a space, so
-// a raw "+" is escaped to %2B before decoding. Without this, a URL such as
-// ?password=a+b would have its password rewritten to "a b".
-func parseQuery(rawQuery string) (url.Values, error) {
-	return url.ParseQuery(strings.ReplaceAll(rawQuery, "+", "%2B"))
-}
-
-// encodeQuery encodes q as a query string using PostgreSQL URI encoding.
-// url.Values.Encode emits "+" for spaces, which pgx parses literally, so spaces
-// are rewritten to %20. Literal plus signs are unaffected: Encode already
-// escapes them as %2B, so every "+" left in the encoded output was a space.
-func encodeQuery(q url.Values) string {
-	return strings.ReplaceAll(q.Encode(), "+", "%20")
+// rewriteQuery rebuilds rawQuery for the generated database. Every parameter is
+// preserved verbatim -- including ordering, duplicates, percent-encoding, and
+// literal "+" signs that pgx reads as plus signs rather than spaces -- except
+// dbname/database, which pgx lets override the path, so they are dropped to
+// keep the generated database authoritative. Keys are percent-decoded only to
+// recognize those parameters; the raw pair is emitted unchanged.
+//
+// sawSSL reports whether an ssl or sslmode key was present, so the caller can
+// avoid adding a default that would override the requested TLS mode.
+func rewriteQuery(rawQuery string) (rewritten string, sawSSL bool) {
+	kept := make([]string, 0, strings.Count(rawQuery, "&")+1)
+	for _, param := range strings.Split(rawQuery, "&") {
+		if param == "" {
+			continue
+		}
+		rawKey, _, _ := strings.Cut(param, "=")
+		// PathUnescape percent-decodes without turning "+" into a space.
+		key, err := url.PathUnescape(rawKey)
+		if err != nil {
+			// pgx rejects the same malformed escape when it parses the URL.
+			key = rawKey
+		}
+		if strings.EqualFold(key, "dbname") || strings.EqualFold(key, "database") {
+			continue
+		}
+		if strings.EqualFold(key, "ssl") || strings.EqualFold(key, "sslmode") {
+			sawSSL = true
+		}
+		kept = append(kept, param)
+	}
+	return strings.Join(kept, "&"), sawSSL
 }
 
 func fatalOnError(t TB, err error, msg string) {

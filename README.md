@@ -22,7 +22,7 @@ Pass the URL explicitly when the test should not depend on the environment:
 tdb := pgtestdb.New(t, pgtestdb.WithDBURL("postgres://user:password@db-host:5432/postgres"))
 ```
 
-`pgtestdb` keeps the URL's host, port, credentials, and other query parameters. It replaces the database path for the test database, drops any `dbname` or `database` query parameter that would otherwise override that path, and defaults `sslmode` to `disable` when the URL specifies neither `sslmode` nor the `ssl` alias (so `ssl=true` still means `sslmode=require`). Query values are encoded the way PostgreSQL URIs are decoded: a literal `+` stays a plus sign, and spaces are written as `%20`.
+`pgtestdb` rewrites the URL textually rather than decoding and re-encoding it, so PostgreSQL URI semantics are preserved exactly. The scheme, the authority (credentials, IPv6 literals, comma-separated hosts, and percent-encoded Unix socket paths such as `%2Fvar%2Frun%2Fpostgresql`), and every remaining query parameter are copied through unchanged: a literal `+` stays a plus sign and `%XX` escapes are untouched. It replaces the database path for the test database, drops any `dbname` or `database` query parameter that would otherwise override that path, and defaults `sslmode` to `disable` when the URL specifies neither `sslmode` nor the `ssl` alias (so `ssl=true` still means `sslmode=require`).
 
 ## Leftover databases
 
