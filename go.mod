@@ -1,6 +1,6 @@
 module github.com/instacart/go-pgtestdb
 
-go 1.25.6
+go 1.25.0
 
 require (
 	github.com/jackc/pgx/v5 v5.13.0
