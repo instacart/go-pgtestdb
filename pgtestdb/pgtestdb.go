@@ -235,12 +235,22 @@ func buildURL(t TB, baseURL, dbName string) string {
 		t.Fatalf("pgtestdb: database URL must start with scheme://")
 	}
 
-	// The authority runs to the first path separator or query delimiter:
-	// userinfo, IPv6 literals, comma-separated hosts, and percent-encoded Unix
-	// socket paths are all kept exactly as given.
-	end := strings.IndexAny(rest, "/?")
+	// The authority runs to the first path separator or query delimiter.
+	// Userinfo ends at the first '@' before the path; a '?' before that '@'
+	// belongs to the credentials (pgx accepts it there), not to the query.
+	// Everything up to the authority's end is kept exactly as given: userinfo,
+	// IPv6 literals, comma-separated hosts, and percent-encoded Unix sockets.
+	authorityStart := 0
+	if at := strings.IndexByte(rest, '@'); at >= 0 {
+		if slash := strings.IndexByte(rest, '/'); slash < 0 || at < slash {
+			authorityStart = at + 1
+		}
+	}
+	end := strings.IndexAny(rest[authorityStart:], "/?")
 	if end < 0 {
 		end = len(rest)
+	} else {
+		end += authorityStart
 	}
 	authority, rest := rest[:end], rest[end:]
 
@@ -286,6 +296,8 @@ func rewriteQuery(rawQuery string) (rewritten string, sawSSL bool) {
 			continue
 		}
 		rawKey, _, _ := strings.Cut(param, "=")
+		// pgx trims surrounding raw ASCII spaces before decoding a key.
+		rawKey = strings.Trim(rawKey, " ")
 		// PathUnescape percent-decodes without turning "+" into a space.
 		key, err := url.PathUnescape(rawKey)
 		if err != nil {

@@ -325,6 +325,46 @@ func TestPgtestdb(t *testing.T) {
 			assert.NotContains(t, got, "sslmode=disable")
 		})
 
+		t.Run("PreservesSemicolonInQueryValue", func(t *testing.T) {
+			base := "postgres://localhost:5432/postgres?password=a;b&sslmode=disable"
+			got := buildURL(t, base, "pgtestdb_abc")
+
+			assert.Contains(t, got, "password=a;b")
+			cfg, err := pgx.ParseConfig(got)
+			assert.NoError(t, err)
+			assert.Equal(t, "a;b", cfg.Password)
+		})
+
+		t.Run("PreservesSSLOrdering", func(t *testing.T) {
+			base := "postgres://localhost:5432/postgres?sslmode=disable&ssl=true"
+			got := buildURL(t, base, "pgtestdb_abc")
+
+			assert.Contains(t, got, "sslmode=disable&ssl=true")
+			cfg, err := pgx.ParseConfig(got)
+			assert.NoError(t, err)
+			assert.NotNil(t, cfg.TLSConfig, "the final ssl=true alias must win")
+		})
+
+		t.Run("DropsAliasesWithRawKeySpaces", func(t *testing.T) {
+			base := "postgres://localhost:5432/postgres?dbname =shared& database=other&sslmode=disable"
+			got := buildURL(t, base, "pgtestdb_abc")
+
+			cfg, err := pgxpool.ParseConfig(got)
+			assert.NoError(t, err)
+			assert.Equal(t, "pgtestdb_abc", cfg.ConnConfig.Database)
+		})
+
+		t.Run("KeepsUserinfoQuestionMark", func(t *testing.T) {
+			base := "postgres://user:p?ss@localhost:5432/postgres"
+			got := buildURL(t, base, "pgtestdb_abc")
+
+			assert.Contains(t, got, "postgres://user:p?ss@localhost:5432/pgtestdb_abc?")
+			cfg, err := pgx.ParseConfig(got)
+			assert.NoError(t, err)
+			assert.Equal(t, "p?ss", cfg.Password)
+			assert.Equal(t, "pgtestdb_abc", cfg.Database)
+		})
+
 		t.Run("KeepsEscapedUnixSocketHost", func(t *testing.T) {
 			// net/url rejects %2F in the host, but pgx follows libpq and
 			// percent-decodes the authority, so the raw rewrite must keep it.
