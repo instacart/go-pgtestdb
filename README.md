@@ -63,7 +63,7 @@ func TestUsers(t *testing.T) {
 To clone an existing database, use `WithTemplate`:
 
 ```go
-tdb := pgtestdb.New(t, pgtestdb.WithTemplate("identity_platform_test"))
+tdb := pgtestdb.New(t, pgtestdb.WithTemplate("myapp_template"))
 ```
 
 The template must already exist and must be a trusted PostgreSQL database identifier. PostgreSQL must be able to create the new database from that template. `WithStatements` can also be supplied with `WithTemplate` to apply additional setup after the clone.
@@ -121,7 +121,7 @@ if !ok {
 2. Drop the generated database.
 3. Close the admin connection.
 
-Close any additional connections opened by the test before cleanup runs. If dropping a database fails, usually because a connection is still open, `pgtestdb` creates a `<database>_requires_cleanup` marker database. A later `New` removes leftover marker databases before creating its own database.
+Close any additional connections opened by the test before cleanup runs. If dropping a database fails, usually because a connection is still open, the `<name>_requires_cleanup` marker and retry behavior described in [Leftover databases](#leftover-databases) apply.
 
 ## Development
 
