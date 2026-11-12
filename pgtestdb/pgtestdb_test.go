@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestPgtestdb(t *testing.T) {
@@ -162,8 +163,7 @@ func TestPgtestdb(t *testing.T) {
 		dbName := dbNamePrefix + fmt.Sprintf("%x", rand.Uint64())
 		ExecOrFail(t, conn, createDatabaseSQL(dbName, ""))
 		ExecOrFail(t, conn, createDatabaseSQL(dbName+cleanupSuffix, ""))
-		busy, err := pgx.Connect(ctx, buildURL(t, resolveDBURL(""), dbName))
-		fatalOnError(t, err, "pgtestdb: connect to leftover DB")
+		busy := connect(ctx, t, buildURL(t, resolveDBURL(""), dbName, true))
 
 		// A second leftover that is not busy: cleanup must still reach it.
 		freeName := dbNamePrefix + fmt.Sprintf("%x", rand.Uint64())
@@ -272,7 +272,7 @@ func TestPgtestdb(t *testing.T) {
 
 	t.Run("WithDBURL", func(t *testing.T) {
 		t.Setenv("TEST_DATABASE_URL", "postgres://env-host:5432/envdb?sslmode=require")
-		got := buildURL(t, resolveDBURL("postgres://option-host:5433/optdb"), "pgtestdb_abc")
+		got := buildURL(t, resolveDBURL("postgres://option-host:5433/optdb"), "pgtestdb_abc", true)
 		assert.NotContains(t, got, "env-host")
 		assert.Contains(t, got, "sslmode=disable")
 
@@ -286,7 +286,7 @@ func TestPgtestdb(t *testing.T) {
 	t.Run("buildURL", func(t *testing.T) {
 		t.Run("KeepsSSLMODEFromEnv", func(t *testing.T) {
 			t.Setenv("TEST_DATABASE_URL", "postgres://localhost:5432/postgres?sslmode=require")
-			got := buildURL(t, resolveDBURL(""), "pgtestdb_abc")
+			got := buildURL(t, resolveDBURL(""), "pgtestdb_abc", true)
 			assert.Contains(t, got, "/pgtestdb_abc?")
 			assert.Contains(t, got, "sslmode=require")
 			assert.NotContains(t, got, "sslmode=disable")
@@ -294,19 +294,19 @@ func TestPgtestdb(t *testing.T) {
 
 		t.Run("AddsDisableWhenAbsent", func(t *testing.T) {
 			t.Setenv("TEST_DATABASE_URL", "postgres://localhost:5432/postgres")
-			got := buildURL(t, resolveDBURL(""), "pgtestdb_abc")
+			got := buildURL(t, resolveDBURL(""), "pgtestdb_abc", true)
 			assert.Equal(t, "postgres://localhost:5432/pgtestdb_abc?sslmode=disable", got)
 		})
 
 		t.Run("DefaultEnvUsesDisable", func(t *testing.T) {
 			t.Setenv("TEST_DATABASE_URL", "")
-			got := buildURL(t, resolveDBURL(""), "pgtestdb_abc")
+			got := buildURL(t, resolveDBURL(""), "pgtestdb_abc", true)
 			assert.Equal(t, "postgres://localhost:5432/pgtestdb_abc?sslmode=disable", got)
 		})
 
 		t.Run("HonorsSSLTrueAlias", func(t *testing.T) {
 			base := "postgres://localhost:5432/postgres?ssl=true"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			assert.Contains(t, got, "ssl=true")
 			assert.NotContains(t, got, "sslmode=", "must not override the ssl=true alias")
@@ -318,7 +318,7 @@ func TestPgtestdb(t *testing.T) {
 
 		t.Run("HonorsExplicitSSLModeWithSSLTrue", func(t *testing.T) {
 			base := "postgres://localhost:5432/postgres?ssl=true&sslmode=verify-full"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			assert.Contains(t, got, "ssl=true")
 			assert.Contains(t, got, "sslmode=verify-full")
@@ -327,7 +327,7 @@ func TestPgtestdb(t *testing.T) {
 
 		t.Run("PreservesSemicolonInQueryValue", func(t *testing.T) {
 			base := "postgres://localhost:5432/postgres?password=a;b&sslmode=disable"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			assert.Contains(t, got, "password=a;b")
 			cfg, err := pgx.ParseConfig(got)
@@ -337,7 +337,7 @@ func TestPgtestdb(t *testing.T) {
 
 		t.Run("PreservesSSLOrdering", func(t *testing.T) {
 			base := "postgres://localhost:5432/postgres?sslmode=disable&ssl=true"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			assert.Contains(t, got, "sslmode=disable&ssl=true")
 			cfg, err := pgx.ParseConfig(got)
@@ -345,9 +345,35 @@ func TestPgtestdb(t *testing.T) {
 			assert.NotNil(t, cfg.TLSConfig, "the final ssl=true alias must win")
 		})
 
+		t.Run("AdminURLKeepsDatabaseAndDefaultsSSL", func(t *testing.T) {
+			t.Setenv("PGSSLMODE", "require")
+			got := buildURL(t, "postgres://localhost:5432/postgres", "", false)
+			assert.Equal(t, "postgres://localhost:5432/postgres?sslmode=disable", got)
+		})
+
+		t.Run("AdminURLPreservesDatabaseQueryOverride", func(t *testing.T) {
+			t.Setenv("PGSSLMODE", "require")
+			got := buildURL(t, "postgres://user@localhost/?dbname=admin", "", false)
+			assert.Equal(t, "postgres://user@localhost/?dbname=admin&sslmode=disable", got)
+
+			cfg, err := pgxpool.ParseConfig(got)
+			require.NoError(t, err)
+			assert.Equal(t, "admin", cfg.ConnConfig.Database)
+		})
+
+		t.Run("PathlessURLIgnoresSlashInQuery", func(t *testing.T) {
+			t.Setenv("PGSSLMODE", "require")
+			got := buildURL(t, "postgres://localhost?application_name=worker/service", "", false)
+			assert.Equal(t, "postgres://localhost/?application_name=worker/service&sslmode=disable", got)
+
+			cfg, err := pgxpool.ParseConfig(got)
+			require.NoError(t, err)
+			assert.NotEqual(t, "service", cfg.ConnConfig.Database)
+		})
+
 		t.Run("DropsAliasesWithRawKeySpaces", func(t *testing.T) {
 			base := "postgres://localhost:5432/postgres?dbname =shared& database=other&sslmode=disable"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			cfg, err := pgxpool.ParseConfig(got)
 			assert.NoError(t, err)
@@ -356,7 +382,7 @@ func TestPgtestdb(t *testing.T) {
 
 		t.Run("KeepsUserinfoQuestionMark", func(t *testing.T) {
 			base := "postgres://user:p?ss@localhost:5432/postgres"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			assert.Contains(t, got, "postgres://user:p?ss@localhost:5432/pgtestdb_abc?")
 			cfg, err := pgx.ParseConfig(got)
@@ -369,7 +395,7 @@ func TestPgtestdb(t *testing.T) {
 			// net/url rejects %2F in the host, but pgx follows libpq and
 			// percent-decodes the authority, so the raw rewrite must keep it.
 			base := "postgres://user@%2Fvar%2Frun%2Fpostgresql/postgres"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			assert.Equal(t,
 				"postgres://user@%2Fvar%2Frun%2Fpostgresql/pgtestdb_abc?sslmode=disable", got)
@@ -387,7 +413,7 @@ func TestPgtestdb(t *testing.T) {
 				"[::1]:5432",
 				"user:p%40ss@[::1]:5432",
 			} {
-				got := buildURL(t, "postgres://"+authority+"/postgres", "pgtestdb_abc")
+				got := buildURL(t, "postgres://"+authority+"/postgres", "pgtestdb_abc", true)
 				assert.Contains(t, got, "postgres://"+authority+"/pgtestdb_abc?")
 
 				_, err := pgxpool.ParseConfig(got)
@@ -397,7 +423,7 @@ func TestPgtestdb(t *testing.T) {
 
 		t.Run("PreservesLiteralPlusInQuery", func(t *testing.T) {
 			base := "postgres://localhost:5432/postgres?password=a+b&sslmode=disable"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			// pgx reads a raw "+" as a literal plus sign, so the raw
 			// parameter is kept as is rather than re-encoded.
@@ -412,7 +438,7 @@ func TestPgtestdb(t *testing.T) {
 
 		t.Run("DropsDBNameAliases", func(t *testing.T) {
 			base := "postgres://localhost:5432/other?dbname=shared&database=other&%64bname=encoded&DataBase=mixed&sslmode=require"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			assert.Contains(t, got, "/pgtestdb_abc?")
 			assert.Contains(t, got, "sslmode=require")
@@ -427,7 +453,7 @@ func TestPgtestdb(t *testing.T) {
 
 		t.Run("PreservesPercentEncoding", func(t *testing.T) {
 			base := "postgres://testuser:a%20b@localhost:5432/postgres?options=-c%20search_path%3Dpublic&application_name=my%20app"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			assert.Contains(t, got, "a%20b")
 			assert.Contains(t, got, "my%20app")
@@ -441,7 +467,7 @@ func TestPgtestdb(t *testing.T) {
 
 		t.Run("KeepsLiteralPlusEncoded", func(t *testing.T) {
 			base := "postgres://localhost:5432/postgres?options=-c%20x%3D1&application_name=a%2Bb"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			assert.Contains(t, got, "application_name=a%2Bb")
 			assert.NotContains(t, got, "a+b")
@@ -453,7 +479,7 @@ func TestPgtestdb(t *testing.T) {
 
 		t.Run("PreservesOrderingAndDuplicates", func(t *testing.T) {
 			base := "postgres://localhost:5432/postgres?application_name=first&x=1&application_name=last"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			assert.Contains(t,
 				got,
@@ -466,7 +492,7 @@ func TestPgtestdb(t *testing.T) {
 
 		t.Run("PreservesPoolOptions", func(t *testing.T) {
 			base := "postgres://localhost:5432/postgres?pool_max_conns=7&pool_min_conns=2&sslmode=disable"
-			got := buildURL(t, base, "pgtestdb_abc")
+			got := buildURL(t, base, "pgtestdb_abc", true)
 
 			assert.Contains(t, got, "pool_max_conns=7")
 			assert.Contains(t, got, "pool_min_conns=2")
