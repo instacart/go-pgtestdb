@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -64,11 +65,45 @@ func TestPgtestdb(t *testing.T) {
 		dbName := dbNamePrefix + fmt.Sprintf("%x", rand.Uint64())
 		ExecOrFail(t, conn, createDatabaseSQL(dbName+cleanupSuffix, ""))
 
-		assert.Contains(t, getDBNamesToCleanup(ctx, t, conn), dbName)
+		// decoy matches the pattern with unescaped underscores (LIKE treats _
+		// as any single character) but is not a cleanup marker.
+		decoy := dbNamePrefix + "prod_requiresXcleanup"
+		ExecOrFail(t, conn, createDatabaseSQL(decoy, ""))
+		defer func() { _, _ = conn.Exec(ctx, dropDatabaseSQL(decoy)) }()
+
+		names := getDBNamesToCleanup(ctx, t, conn)
+		assert.Contains(t, names, dbName)
+		assert.NotContains(t, names, decoy)
+		assert.True(t, dbExists(ctx, t, conn, decoy))
 
 		cleanUpOldDBs(ctx, t, conn)
 
 		assert.NotContains(t, getDBNamesToCleanup(ctx, t, conn), dbName)
+		assert.False(t, dbExists(ctx, t, conn, dbName))
+		assert.True(t, dbExists(ctx, t, conn, decoy), "cleanup must not drop a database that only resembles a marker")
+	})
+
+	t.Run("escapeLike", func(t *testing.T) {
+		assert.Equal(t, `pgtestdb\_`, escapeLike(dbNamePrefix))
+		assert.Equal(t, `\_requires\_cleanup`, escapeLike(cleanupSuffix))
+		assert.Equal(t, `100\%\_a\\b`, escapeLike(`100%_a\b`))
+		assert.Equal(t, "plain", escapeLike("plain"))
+	})
+
+	t.Run("cleanupMarkerName", func(t *testing.T) {
+		name, ok := cleanupMarkerName(dbNamePrefix + "abc" + cleanupSuffix)
+		assert.True(t, ok)
+		assert.Equal(t, dbNamePrefix+"abc", name)
+
+		for _, datname := range []string{
+			dbNamePrefix + "prod_requiresXcleanup",
+			dbNamePrefix + "abc",
+			"other" + cleanupSuffix,
+			"plain",
+		} {
+			_, ok := cleanupMarkerName(datname)
+			assert.False(t, ok, datname)
+		}
 	})
 
 	t.Run("tryDropDB", func(t *testing.T) {
@@ -177,7 +212,54 @@ func TestPgtestdb(t *testing.T) {
 			assert.Equal(t, "disable", u.Query().Get("sslmode"))
 			assert.Equal(t, "/postgres", u.Path)
 		})
+
+		t.Run("DropsDBNameAliases", func(t *testing.T) {
+			base := "postgres://localhost:5432/postgres?dbname=shared&database=other&sslmode=require"
+			u, err := url.Parse(buildURL(t, base, "pgtestdb_abc"))
+			assert.NoError(t, err)
+			assert.Equal(t, "/pgtestdb_abc", u.Path)
+			assert.False(t, u.Query().Has("dbname"))
+			assert.False(t, u.Query().Has("database"))
+			assert.Equal(t, "require", u.Query().Get("sslmode"))
+		})
+
+		t.Run("EncodesSpacesAsPercent20", func(t *testing.T) {
+			base := "postgres://testuser:a%20b@localhost:5432/postgres?options=-c%20search_path%3Dpublic&application_name=my%20app"
+			got := buildURL(t, base, "pgtestdb_abc")
+
+			assert.Contains(t, got, "a%20b")
+			assert.Contains(t, got, "my%20app")
+			assert.NotContains(t, got, "+")
+
+			u, err := url.Parse(got)
+			assert.NoError(t, err)
+			assert.Equal(t, "my app", u.Query().Get("application_name"))
+			assert.Equal(t, "-c search_path=public", u.Query().Get("options"))
+			password, _ := u.User.Password()
+			assert.Equal(t, "a b", password)
+		})
+
+		t.Run("KeepsLiteralPlusEncoded", func(t *testing.T) {
+			base := "postgres://localhost:5432/postgres?options=-c%20x%3D1&application_name=a%2Bb"
+			got := buildURL(t, base, "pgtestdb_abc")
+
+			assert.Contains(t, got, "application_name=a%2Bb")
+			assert.NotContains(t, got, "a+b")
+
+			u, err := url.Parse(got)
+			assert.NoError(t, err)
+			assert.Equal(t, "a+b", u.Query().Get("application_name"))
+		})
 	})
+}
+
+// dbExists reports whether the server has a database named name.
+func dbExists(ctx context.Context, t TB, conn *pgx.Conn, name string) bool {
+	t.Helper()
+	var exists bool
+	err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", name).Scan(&exists)
+	fatalOnError(t, err, "pgtestdb: check DB exists")
+	return exists
 }
 
 type fakeTestingT struct {

@@ -183,15 +183,28 @@ func buildURL(t TB, baseURL, dbName string) string {
 	t.Helper()
 	u, err := url.Parse(baseURL)
 	fatalOnError(t, err, "pgtestdb: parse database URL")
+	q := u.Query()
 	if dbName != "" {
 		u.Path = "/" + dbName
+		// pgx lets the dbname/database query aliases override the path, so
+		// drop them; otherwise the pool would connect to the base database
+		// while only the unused generated database is dropped.
+		q.Del("dbname")
+		q.Del("database")
 	}
-	q := u.Query()
 	if !q.Has("sslmode") {
 		q.Set("sslmode", "disable")
 	}
-	u.RawQuery = q.Encode()
+	u.RawQuery = encodeQuery(q)
 	return u.String()
+}
+
+// encodeQuery encodes q as a query string using PostgreSQL URI encoding.
+// url.Values.Encode emits "+" for spaces, which pgx parses literally, so spaces
+// are rewritten to %20. Literal plus signs are unaffected: Encode already
+// escapes them as %2B, so every "+" left in the encoded output was a space.
+func encodeQuery(q url.Values) string {
+	return strings.ReplaceAll(q.Encode(), "+", "%20")
 }
 
 func fatalOnError(t TB, err error, msg string) {
@@ -201,18 +214,40 @@ func fatalOnError(t TB, err error, msg string) {
 	}
 }
 
+// likeEscaper escapes the LIKE pattern metacharacters %, _ and \ so that text
+// containing them matches literally under ESCAPE '\'.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// escapeLike escapes s so it matches literally inside a LIKE pattern.
+func escapeLike(s string) string {
+	return likeEscaper.Replace(s)
+}
+
+// cleanupMarkerName returns the database name that the marker datname points
+// at. It reports false unless datname has the literal pgtestdb_ prefix and
+// _requires_cleanup suffix, so a LIKE pattern that over-matches can never cause
+// an unrelated database to be dropped.
+func cleanupMarkerName(datname string) (string, bool) {
+	if !strings.HasPrefix(datname, dbNamePrefix) || !strings.HasSuffix(datname, cleanupSuffix) {
+		return "", false
+	}
+	return strings.TrimSuffix(datname, cleanupSuffix), true
+}
+
 func getDBNamesToCleanup(ctx context.Context, t TB, conn *pgx.Conn) []string {
 	t.Helper()
-	pattern := dbNamePrefix + "%" + cleanupSuffix
-	rows, err := conn.Query(ctx, "SELECT datname FROM pg_database WHERE datname LIKE $1", pattern)
+	pattern := escapeLike(dbNamePrefix) + "%" + escapeLike(cleanupSuffix)
+	rows, err := conn.Query(ctx, `SELECT datname FROM pg_database WHERE datname LIKE $1 ESCAPE '\'`, pattern)
 	fatalOnError(t, err, "pgtestdb: query for DBs to clean up")
 	defer rows.Close()
 
 	var names []string
 	for rows.Next() {
-		var name string
-		fatalOnError(t, rows.Scan(&name), "pgtestdb: scan DB name")
-		names = append(names, strings.TrimSuffix(name, cleanupSuffix))
+		var datname string
+		fatalOnError(t, rows.Scan(&datname), "pgtestdb: scan DB name")
+		if name, ok := cleanupMarkerName(datname); ok {
+			names = append(names, name)
+		}
 	}
 	fatalOnError(t, rows.Err(), "pgtestdb: read DB names for cleanup")
 	return names

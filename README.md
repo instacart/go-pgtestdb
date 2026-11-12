@@ -22,7 +22,7 @@ Pass the URL explicitly when the test should not depend on the environment:
 tdb := pgtestdb.New(t, pgtestdb.WithDBURL("postgres://user:password@db-host:5432/postgres"))
 ```
 
-`pgtestdb` keeps the URL's host, port, credentials, and other query parameters. It replaces the database path for the test database and defaults `sslmode` to `disable` when the URL does not specify it.
+`pgtestdb` keeps the URL's host, port, credentials, and other query parameters. It replaces the database path for the test database, drops any `dbname` or `database` query parameter that would otherwise override that path, and defaults `sslmode` to `disable` when the URL does not specify it.
 
 ## Leftover databases
 
