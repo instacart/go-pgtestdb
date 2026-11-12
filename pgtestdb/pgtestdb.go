@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -90,6 +91,13 @@ func WithDBURL(dbURL string) Option {
 // It receives the real result and returns the result to use.
 var dropDBResultHook = func(actual bool) bool { return actual }
 
+// poolCloseTimeout bounds how long cleanup waits for pgxpool.Close to return.
+// Close blocks until every acquired connection is returned, which never
+// happens when a test exits while holding a transaction. Without the bound the
+// remaining cleanups (drop attempt, marker creation, admin close) would never
+// run and the suite would hang until its global timeout.
+var poolCloseTimeout = 5 * time.Second
+
 // New creates a temporary Postgres database for the duration of t.
 //
 // The database is automatically dropped at t.Cleanup. The connection URL comes
@@ -129,7 +137,10 @@ func New(t TB, opts ...Option) *TestDB {
 	testURL := buildURL(t, baseURL, dbName)
 	pool, err := pgxpool.New(ctx, testURL)
 	fatalOnError(t, err, "pgtestdb: create pool for test db")
-	t.Cleanup(func() { pool.Close() }) // registered 3rd: runs first (LIFO), before tryDropDB
+	// registered 3rd: runs first (LIFO), before tryDropDB. The close is
+	// bounded so a test that exits while holding a transaction cannot keep the
+	// drop attempt, marker creation, and admin close from running.
+	t.Cleanup(func() { closePool(t, pool) })
 
 	for _, stmt := range cfg.statements {
 		ExecOrFail(t, pool, stmt)
@@ -158,9 +169,34 @@ func ExecOrError(t TB, exec execer, stmt string, args ...any) bool {
 	return true
 }
 
+// closePool closes pool without letting a stuck connection hold up the rest of
+// the cleanup chain. pgxpool.Close waits for acquired connections to be
+// returned; a test that exited through Fatal while holding an uncommitted
+// transaction never returns them. Cleanup therefore waits at most
+// poolCloseTimeout and then continues, leaving the abandoned connections to be
+// torn down when the process exits.
+func closePool(t TB, pool *pgxpool.Pool) {
+	t.Helper()
+	closed := make(chan struct{})
+	go func() {
+		pool.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(poolCloseTimeout):
+	}
+}
+
 func adminConnect(ctx context.Context, t TB, baseURL string) *pgx.Conn {
 	t.Helper()
-	conn, err := pgx.Connect(ctx, buildURL(t, baseURL, ""))
+	// The admin connection shares the base URL with the test pool, so it can
+	// carry pool_* options (pool_max_conns, ...). Parse with pgxpool, which
+	// consumes those as pool settings; pgx.Connect would instead forward them
+	// as startup parameters, which PostgreSQL rejects.
+	cfg, err := pgxpool.ParseConfig(buildURL(t, baseURL, ""))
+	fatalOnError(t, err, "pgtestdb: parse database URL")
+	conn, err := pgx.ConnectConfig(ctx, cfg.ConnConfig)
 	fatalOnError(t, err, "pgtestdb: admin connect")
 	return conn
 }
@@ -183,7 +219,8 @@ func buildURL(t TB, baseURL, dbName string) string {
 	t.Helper()
 	u, err := url.Parse(baseURL)
 	fatalOnError(t, err, "pgtestdb: parse database URL")
-	q := u.Query()
+	q, err := parseQuery(u.RawQuery)
+	fatalOnError(t, err, "pgtestdb: parse database URL query")
 	if dbName != "" {
 		u.Path = "/" + dbName
 		// pgx lets the dbname/database query aliases override the path, so
@@ -192,11 +229,21 @@ func buildURL(t TB, baseURL, dbName string) string {
 		q.Del("dbname")
 		q.Del("database")
 	}
-	if !q.Has("sslmode") {
+	// pgx maps the ssl=true alias to sslmode=require. Adding sslmode=disable
+	// would win over the alias and silently drop requested TLS.
+	if !q.Has("sslmode") && !q.Has("ssl") {
 		q.Set("sslmode", "disable")
 	}
 	u.RawQuery = encodeQuery(q)
 	return u.String()
+}
+
+// parseQuery decodes rawQuery using PostgreSQL URI semantics. Unlike
+// url.ParseQuery, pgx treats "+" as a literal plus sign rather than a space, so
+// a raw "+" is escaped to %2B before decoding. Without this, a URL such as
+// ?password=a+b would have its password rewritten to "a b".
+func parseQuery(rawQuery string) (url.Values, error) {
+	return url.ParseQuery(strings.ReplaceAll(rawQuery, "+", "%2B"))
 }
 
 // encodeQuery encodes q as a query string using PostgreSQL URI encoding.
@@ -251,8 +298,17 @@ func getDBNamesToCleanup(ctx context.Context, t TB, conn *pgx.Conn) []string {
 func cleanUpOldDBs(ctx context.Context, t TB, conn *pgx.Conn) {
 	t.Helper()
 	for _, name := range getDBNamesToCleanup(ctx, t, conn) {
-		ExecOrFail(t, conn, dropDatabaseSQL(name))
-		ExecOrFail(t, conn, dropDatabaseSQL(name+cleanupSuffix))
+		// A leftover database can still have connections attached (a test that
+		// died holding one, or a concurrent process). DROP DATABASE fails in
+		// that case; keep the target and its marker for a later run and move
+		// on, so one busy leftover cannot stop this test from getting its own
+		// database.
+		if _, err := conn.Exec(ctx, dropDatabaseSQL(name)); err != nil {
+			continue
+		}
+		// Only forget the marker once the database it points at is gone;
+		// otherwise the marker would be the only record of the leftover.
+		_, _ = conn.Exec(ctx, dropDatabaseSQL(name+cleanupSuffix))
 	}
 }
 

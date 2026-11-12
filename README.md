@@ -22,7 +22,7 @@ Pass the URL explicitly when the test should not depend on the environment:
 tdb := pgtestdb.New(t, pgtestdb.WithDBURL("postgres://user:password@db-host:5432/postgres"))
 ```
 
-`pgtestdb` keeps the URL's host, port, credentials, and other query parameters. It replaces the database path for the test database, drops any `dbname` or `database` query parameter that would otherwise override that path, and defaults `sslmode` to `disable` when the URL does not specify it.
+`pgtestdb` keeps the URL's host, port, credentials, and other query parameters. It replaces the database path for the test database, drops any `dbname` or `database` query parameter that would otherwise override that path, and defaults `sslmode` to `disable` when the URL specifies neither `sslmode` nor the `ssl` alias (so `ssl=true` still means `sslmode=require`). Query values are encoded the way PostgreSQL URIs are decoded: a literal `+` stays a plus sign, and spaces are written as `%20`.
 
 ## Leftover databases
 
@@ -30,7 +30,9 @@ Every test database is dropped at cleanup. If the drop fails — typically becau
 connection or an open transaction behind — the library records a marker database named
 `<name>_requires_cleanup` instead of losing track of it. The next run drops any marked database
 together with the database it points at, so abandoned test databases do not accumulate across
-runs and fill the disk.
+runs and fill the disk. A marked database that is still in use cannot be dropped: cleanup keeps
+both the database and its marker for a later run and carries on with the next one, so it never
+prevents a new test from getting its own database.
 
 ## Creating a test database
 
@@ -115,7 +117,7 @@ if !ok {
 
 `pgtestdb.New` registers cleanup callbacks on the supplied test object. Cleanup happens in this order:
 
-1. Close the test pool.
+1. Close the test pool (waiting only briefly, so an abandoned transaction cannot stall the rest of cleanup).
 2. Drop the generated database.
 3. Close the admin connection.
 

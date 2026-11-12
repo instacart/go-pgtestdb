@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"math/rand"
 	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
@@ -19,6 +21,68 @@ func TestPgtestdb(t *testing.T) {
 		ExecOrError(t, tdb.Pool(), "SELECT * FROM testtable LIMIT 1")
 		assert.NotEmpty(t, tdb.Name())
 		assert.NotEmpty(t, tdb.URL())
+	})
+
+	t.Run("NewWithPoolOptionsInDBURL", func(t *testing.T) {
+		base := resolveDBURL("")
+		sep := "?"
+		if strings.Contains(base, "?") {
+			sep = "&"
+		}
+		// pool_max_conns is a pgxpool option: it must be consumed by the pool
+		// configuration and never forwarded to the server as a startup
+		// parameter by the admin connection.
+		tdb := New(t, WithDBURL(base+sep+"pool_max_conns=2"))
+
+		assert.NotEmpty(t, tdb.Name())
+		ExecOrError(t, tdb.Pool(), "SELECT 1")
+	})
+
+	t.Run("PoolCloseDoesNotBlockCleanup", func(t *testing.T) {
+		ctx := context.Background()
+
+		oldTimeout := poolCloseTimeout
+		poolCloseTimeout = 100 * time.Millisecond
+		defer func() { poolCloseTimeout = oldTimeout }()
+
+		fakeT := &fakeTestingT{}
+		tdb := New(fakeT, WithDBURL(resolveDBURL("")))
+		if fakeT.fatal {
+			t.Fatalf("New failed: %s", fakeT.errMsg)
+		}
+
+		// Hold an acquired connection in an uncommitted transaction, which is
+		// what a test that exited through Fatal can leave behind. pgxpool.Close
+		// waits for it to be returned.
+		conn, err := tdb.Pool().Acquire(ctx)
+		fatalOnError(t, err, "acquire leaked connection")
+		tx, err := conn.Begin(ctx)
+		fatalOnError(t, err, "begin leaked transaction")
+
+		// The pool close is registered last, so LIFO cleanup runs it first.
+		start := time.Now()
+		fakeT.cleanups[len(fakeT.cleanups)-1]()
+		closeElapsed := time.Since(start)
+		for i := len(fakeT.cleanups) - 2; i >= 0; i-- {
+			fakeT.cleanups[i]()
+		}
+
+		assert.False(t, fakeT.fatal, "cleanup must not abort: %s", fakeT.errMsg)
+		assert.Less(t, closeElapsed, time.Second,
+			"pool close must not wait indefinitely for an abandoned transaction")
+
+		admin := adminConnect(ctx, t, resolveDBURL(""))
+		defer func() { _ = admin.Close(ctx) }()
+
+		assert.True(t, dbExists(ctx, t, admin, tdb.Name()+cleanupSuffix),
+			"a database left busy by an abandoned transaction must be marked")
+
+		// Return the connection so the background Close can finish, then remove
+		// the leftovers this subtest created.
+		fatalOnError(t, tx.Rollback(ctx), "rollback leaked transaction")
+		conn.Release()
+		waitForNoConnections(ctx, t, admin, tdb.Name())
+		cleanUpOldDBs(ctx, t, admin)
 	})
 
 	t.Run("ExecOrError", func(t *testing.T) {
@@ -81,6 +145,33 @@ func TestPgtestdb(t *testing.T) {
 		assert.NotContains(t, getDBNamesToCleanup(ctx, t, conn), dbName)
 		assert.False(t, dbExists(ctx, t, conn, dbName))
 		assert.True(t, dbExists(ctx, t, conn, decoy), "cleanup must not drop a database that only resembles a marker")
+	})
+
+	t.Run("cleanUpOldDBsKeepsBusyDatabase", func(t *testing.T) {
+		ctx := context.Background()
+		conn := adminConnect(ctx, t, resolveDBURL(""))
+		defer func() { _ = conn.Close(ctx) }()
+
+		// A leftover from a run that died while still connected.
+		dbName := dbNamePrefix + fmt.Sprintf("%x", rand.Uint64())
+		ExecOrFail(t, conn, createDatabaseSQL(dbName, ""))
+		ExecOrFail(t, conn, createDatabaseSQL(dbName+cleanupSuffix, ""))
+		busy, err := pgx.Connect(ctx, buildURL(t, resolveDBURL(""), dbName))
+		fatalOnError(t, err, "pgtestdb: connect to leftover DB")
+
+		// A second leftover that is not busy: cleanup must still reach it.
+		freeName := dbNamePrefix + fmt.Sprintf("%x", rand.Uint64())
+		ExecOrFail(t, conn, createDatabaseSQL(freeName+cleanupSuffix, ""))
+
+		cleanUpOldDBs(ctx, t, conn)
+
+		assert.True(t, dbExists(ctx, t, conn, dbName), "busy database must be retained")
+		assert.True(t, dbExists(ctx, t, conn, dbName+cleanupSuffix), "busy database must keep its marker")
+		assert.False(t, dbExists(ctx, t, conn, freeName), "cleanup must continue past a busy database")
+		assert.False(t, dbExists(ctx, t, conn, freeName+cleanupSuffix))
+
+		fatalOnError(t, busy.Close(ctx), "pgtestdb: close leftover connection")
+		cleanUpOldDBs(ctx, t, conn)
 	})
 
 	t.Run("cleanupMarkerName", func(t *testing.T) {
@@ -206,6 +297,33 @@ func TestPgtestdb(t *testing.T) {
 			assert.Equal(t, "/postgres", u.Path)
 		})
 
+		t.Run("HonorsSSLTrueAlias", func(t *testing.T) {
+			base := "postgres://localhost:5432/postgres?ssl=true"
+			got := buildURL(t, base, "pgtestdb_abc")
+
+			u, err := url.Parse(got)
+			assert.NoError(t, err)
+			assert.False(t, u.Query().Has("sslmode"), "must not override the ssl=true alias")
+			assert.Equal(t, "true", u.Query().Get("ssl"))
+
+			cfg, err := pgx.ParseConfig(got)
+			assert.NoError(t, err)
+			assert.NotNil(t, cfg.TLSConfig, "pgx must still select TLS for ssl=true")
+		})
+
+		t.Run("PreservesLiteralPlusInQuery", func(t *testing.T) {
+			base := "postgres://localhost:5432/postgres?password=a+b&sslmode=disable"
+			got := buildURL(t, base, "pgtestdb_abc")
+
+			assert.Contains(t, got, "password=a%2Bb")
+			assert.NotContains(t, got, "a%20b")
+			assert.NotContains(t, got, "a+b")
+
+			cfg, err := pgx.ParseConfig(got)
+			assert.NoError(t, err)
+			assert.Equal(t, "a+b", cfg.Password)
+		})
+
 		t.Run("DropsDBNameAliases", func(t *testing.T) {
 			base := "postgres://localhost:5432/postgres?dbname=shared&database=other&sslmode=require"
 			u, err := url.Parse(buildURL(t, base, "pgtestdb_abc"))
@@ -253,6 +371,25 @@ func dbExists(ctx context.Context, t TB, conn *pgx.Conn, name string) bool {
 	err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", name).Scan(&exists)
 	fatalOnError(t, err, "pgtestdb: check DB exists")
 	return exists
+}
+
+// waitForNoConnections blocks until no backend is connected to dbName, so a
+// database left busy by a background pool close can be dropped.
+func waitForNoConnections(ctx context.Context, t TB, conn *pgx.Conn, dbName string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var count int
+		err := conn.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE datname = $1", dbName).Scan(&count)
+		fatalOnError(t, err, "pgtestdb: count connections")
+		if count == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pgtestdb: timed out waiting for connections to %s to close", dbName)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 type fakeTestingT struct {
