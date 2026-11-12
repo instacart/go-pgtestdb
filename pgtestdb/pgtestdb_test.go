@@ -162,8 +162,7 @@ func TestPgtestdb(t *testing.T) {
 		dbName := dbNamePrefix + fmt.Sprintf("%x", rand.Uint64())
 		ExecOrFail(t, conn, createDatabaseSQL(dbName, ""))
 		ExecOrFail(t, conn, createDatabaseSQL(dbName+cleanupSuffix, ""))
-		busy, err := pgx.Connect(ctx, buildURL(t, resolveDBURL(""), dbName))
-		fatalOnError(t, err, "pgtestdb: connect to leftover DB")
+		busy := connect(ctx, t, buildURL(t, resolveDBURL(""), dbName))
 
 		// A second leftover that is not busy: cleanup must still reach it.
 		freeName := dbNamePrefix + fmt.Sprintf("%x", rand.Uint64())
@@ -343,6 +342,12 @@ func TestPgtestdb(t *testing.T) {
 			cfg, err := pgx.ParseConfig(got)
 			assert.NoError(t, err)
 			assert.NotNil(t, cfg.TLSConfig, "the final ssl=true alias must win")
+		})
+
+		t.Run("AdminURLKeepsDatabaseAndDefaultsSSL", func(t *testing.T) {
+			t.Setenv("PGSSLMODE", "require")
+			got := buildURL(t, "postgres://localhost:5432/postgres", "")
+			assert.Equal(t, "postgres://localhost:5432/postgres?sslmode=disable", got)
 		})
 
 		t.Run("DropsAliasesWithRawKeySpaces", func(t *testing.T) {

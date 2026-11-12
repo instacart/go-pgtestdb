@@ -196,15 +196,20 @@ func closePool(t TB, pool *pgxpool.Pool) {
 
 func adminConnect(ctx context.Context, t TB, baseURL string) *pgx.Conn {
 	t.Helper()
-	// The base URL can carry pool_* options (pool_max_conns, ...). Parse with
-	// pgxpool, which consumes those as pool settings; pgx.Connect would instead
-	// forward them as startup parameters, which PostgreSQL rejects. pgxpool is
-	// also the source of truth for how the URL is interpreted, so the admin
-	// connection uses it directly rather than a rebuilt URL.
-	cfg, err := pgxpool.ParseConfig(baseURL)
+	// Reuse buildURL so the admin connection gets the same sslmode default as
+	// the generated test database while retaining the base URL's database.
+	return connect(ctx, t, buildURL(t, baseURL, ""))
+}
+
+// connect opens a single connection from a URL. It parses with pgxpool so
+// pgxpool-only query parameters are consumed instead of being forwarded to the
+// server as startup parameters.
+func connect(ctx context.Context, t TB, url string) *pgx.Conn {
+	t.Helper()
+	cfg, err := pgxpool.ParseConfig(url)
 	fatalOnError(t, err, "pgtestdb: parse database URL")
 	conn, err := pgx.ConnectConfig(ctx, cfg.ConnConfig)
-	fatalOnError(t, err, "pgtestdb: admin connect")
+	fatalOnError(t, err, "pgtestdb: connect")
 	return conn
 }
 
@@ -254,6 +259,16 @@ func buildURL(t TB, baseURL, dbName string) string {
 	}
 	authority, rest := rest[:end], rest[end:]
 
+	// Preserve the base path for the admin connection (empty dbName); a
+	// generated database name replaces it for the test connection.
+	basePath := "/"
+	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+		basePath = rest[slash:]
+		if query := strings.IndexByte(basePath, '?'); query >= 0 {
+			basePath = basePath[:query]
+		}
+	}
+
 	// The generated database name replaces the base path; only the query is
 	// carried over.
 	var rawQuery string
@@ -272,8 +287,12 @@ func buildURL(t TB, baseURL, dbName string) string {
 	}
 
 	// dbName is generated from a fixed prefix and hex digits, so it needs no
-	// path escaping.
-	u := scheme + "://" + authority + "/" + dbName
+	// path escaping. An empty dbName keeps the base URL's database.
+	path := basePath
+	if dbName != "" {
+		path = "/" + dbName
+	}
+	u := scheme + "://" + authority + path
 	if rawQuery != "" {
 		u += "?" + rawQuery
 	}
