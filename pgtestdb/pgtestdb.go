@@ -138,7 +138,7 @@ func New(t TB, opts ...Option) *TestDB {
 
 	ExecOrFail(t, adminConn, createDatabaseSQL(dbName, cfg.template))
 
-	testURL := buildURL(t, baseURL, dbName)
+	testURL := buildURL(t, baseURL, dbName, true)
 	pool, err := pgxpool.New(ctx, testURL)
 	fatalOnError(t, err, "pgtestdb: create pool for test db")
 	// registered 3rd: runs first (LIFO), before tryDropDB. The close is
@@ -196,15 +196,20 @@ func closePool(t TB, pool *pgxpool.Pool) {
 
 func adminConnect(ctx context.Context, t TB, baseURL string) *pgx.Conn {
 	t.Helper()
-	// The base URL can carry pool_* options (pool_max_conns, ...). Parse with
-	// pgxpool, which consumes those as pool settings; pgx.Connect would instead
-	// forward them as startup parameters, which PostgreSQL rejects. pgxpool is
-	// also the source of truth for how the URL is interpreted, so the admin
-	// connection uses it directly rather than a rebuilt URL.
-	cfg, err := pgxpool.ParseConfig(baseURL)
+	// Reuse buildURL so the admin connection gets the same sslmode default as
+	// the generated test database while retaining the base URL's database.
+	return connect(ctx, t, buildURL(t, baseURL, "", false))
+}
+
+// connect opens a single connection from a URL. It parses with pgxpool so
+// pgxpool-only query parameters are consumed instead of being forwarded to the
+// server as startup parameters.
+func connect(ctx context.Context, t TB, url string) *pgx.Conn {
+	t.Helper()
+	cfg, err := pgxpool.ParseConfig(url)
 	fatalOnError(t, err, "pgtestdb: parse database URL")
 	conn, err := pgx.ConnectConfig(ctx, cfg.ConnConfig)
-	fatalOnError(t, err, "pgtestdb: admin connect")
+	fatalOnError(t, err, "pgtestdb: connect")
 	return conn
 }
 
@@ -228,7 +233,7 @@ func resolveDBURL(optionURL string) string {
 // The authority is therefore copied verbatim and query parameters are kept raw,
 // which also preserves pgx-specific syntax ("+" is a literal plus sign, not a
 // space) that net/url would rewrite.
-func buildURL(t TB, baseURL, dbName string) string {
+func buildURL(t TB, baseURL, dbName string, stripDBAliases bool) string {
 	t.Helper()
 	scheme, rest, ok := strings.Cut(baseURL, "://")
 	if !ok {
@@ -254,13 +259,26 @@ func buildURL(t TB, baseURL, dbName string) string {
 	}
 	authority, rest := rest[:end], rest[end:]
 
+	// Preserve the base path for the admin connection (empty dbName); a
+	// generated database name replaces it for the test connection. Only the
+	// path portion is searched: a slash in a pathless URL's query string is not
+	// a database path.
+	basePath := "/"
+	pathEnd := strings.IndexByte(rest, '?')
+	if pathEnd < 0 {
+		pathEnd = len(rest)
+	}
+	if slash := strings.IndexByte(rest[:pathEnd], '/'); slash >= 0 {
+		basePath = rest[slash:pathEnd]
+	}
+
 	// The generated database name replaces the base path; only the query is
 	// carried over.
 	var rawQuery string
 	if i := strings.IndexByte(rest, '?'); i >= 0 {
 		rawQuery = rest[i+1:]
 	}
-	rawQuery, sawSSL := rewriteQuery(rawQuery)
+	rawQuery, sawSSL := rewriteQuery(rawQuery, stripDBAliases)
 	if !sawSSL {
 		// pgx maps the ssl=true alias to sslmode=require, and an explicit
 		// sslmode wins over the alias, so adding sslmode=disable when neither
@@ -272,8 +290,12 @@ func buildURL(t TB, baseURL, dbName string) string {
 	}
 
 	// dbName is generated from a fixed prefix and hex digits, so it needs no
-	// path escaping.
-	u := scheme + "://" + authority + "/" + dbName
+	// path escaping. An empty dbName keeps the base URL's database.
+	path := basePath
+	if dbName != "" {
+		path = "/" + dbName
+	}
+	u := scheme + "://" + authority + path
 	if rawQuery != "" {
 		u += "?" + rawQuery
 	}
@@ -289,7 +311,7 @@ func buildURL(t TB, baseURL, dbName string) string {
 //
 // sawSSL reports whether an ssl or sslmode key was present, so the caller can
 // avoid adding a default that would override the requested TLS mode.
-func rewriteQuery(rawQuery string) (rewritten string, sawSSL bool) {
+func rewriteQuery(rawQuery string, stripDBAliases bool) (rewritten string, sawSSL bool) {
 	kept := make([]string, 0, strings.Count(rawQuery, "&")+1)
 	for _, param := range strings.Split(rawQuery, "&") {
 		if param == "" {
@@ -304,7 +326,7 @@ func rewriteQuery(rawQuery string) (rewritten string, sawSSL bool) {
 			// pgx rejects the same malformed escape when it parses the URL.
 			key = rawKey
 		}
-		if strings.EqualFold(key, "dbname") || strings.EqualFold(key, "database") {
+		if stripDBAliases && (strings.EqualFold(key, "dbname") || strings.EqualFold(key, "database")) {
 			continue
 		}
 		if strings.EqualFold(key, "ssl") || strings.EqualFold(key, "sslmode") {
